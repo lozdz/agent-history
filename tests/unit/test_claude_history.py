@@ -13779,7 +13779,8 @@ class TestExportPathHandling:
         output_file, output_name = ch._get_export_output_path(
             session, "20251201120000", tmp_path, flat=True, remote_host=None
         )
-        assert output_file == tmp_path / "20251201120000_session-abc.md"
+        # Flat mode still creates a per-agent subdirectory (claude for .jsonl)
+        assert output_file == tmp_path / "claude" / "20251201120000_session-abc.md"
         assert output_name == "20251201120000_session-abc.md"
 
     def test_export_path_with_organized_mode(self, tmp_path):
@@ -13862,9 +13863,9 @@ class TestExportPathHandling:
         ch._get_export_output_path(
             session, "20251201120000", tmp_path, flat=False, remote_host=None
         )
-        # Subdirectory should be created (uses short workspace name from get_workspace_name_from_path)
-        # For "-home-user-myproject", the function returns "user-myproject"
-        assert (tmp_path / "user-myproject").exists()
+        # Subdirectory should be created under the per-agent dir (claude for .jsonl).
+        # For "-home-user-myproject", the workspace name is "user-myproject"
+        assert (tmp_path / "claude" / "user-myproject").exists()
 
 
 # ============================================================================

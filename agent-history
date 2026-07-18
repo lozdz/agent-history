@@ -12105,14 +12105,16 @@ def _get_alias_export_options(args) -> dict:
     }
 
 
-def _get_ws_output_path(output_path: Path, workspace: str, flat: bool) -> Path:
+def _get_ws_output_path(output_path: Path, workspace: str, flat: bool, agent_dir: str) -> Path:
     """Get output path for workspace, creating directory if needed."""
     if flat:
-        return output_path
+        agent_path = output_path / agent_dir
+        agent_path.mkdir(parents=True, exist_ok=True)
+        return agent_path
     ws_name = _alias_workspace_readable(workspace).replace("/", "-").replace("\\", "-")
     if ws_name.startswith("-"):
         ws_name = ws_name[1:]
-    ws_path = output_path / ws_name
+    ws_path = output_path / agent_dir / ws_name
     ws_path.mkdir(parents=True, exist_ok=True)
     return ws_path
 
@@ -12223,15 +12225,17 @@ def _export_session_file(
 
 
 def _alias_html_output_path(
-    output_path: Path, workspace_name: str, source_tag: str, flat: bool
+    output_path: Path, workspace_name: str, source_tag: str, flat: bool, agent_dir: str
 ) -> Path:
     """Return output path for an alias workspace-level HTML bundle."""
     normalized = _alias_workspace_readable(workspace_name).replace("/", "-").replace("\\", "-")
     if normalized.startswith("-"):
         normalized = normalized[1:]
     if flat:
-        return output_path / f"{source_tag}{normalized}.html"
-    ws_output_path = output_path / normalized
+        agent_path = output_path / agent_dir
+        agent_path.mkdir(parents=True, exist_ok=True)
+        return agent_path / f"{source_tag}{normalized}.html"
+    ws_output_path = output_path / agent_dir / normalized
     ws_output_path.mkdir(parents=True, exist_ok=True)
     return ws_output_path / (f"{source_tag[:-1]}.html" if source_tag else "index.html")
 
@@ -12287,7 +12291,11 @@ def _export_alias_html_workspace_sessions(items: list, output_path: Path, opts: 
     groups = {}
     for item in items:
         output_file = _alias_html_output_path(
-            output_path, item["workspace_name"], item["source_tag"], opts["flat"]
+            output_path,
+            item["workspace_name"],
+            item["source_tag"],
+            opts["flat"],
+            _get_export_agent_dir(item["session"]),
         )
         groups.setdefault(output_file, []).append(item)
 
@@ -12318,7 +12326,8 @@ def _alias_export_or_collect_html(
         )
         return
 
-    ws_output_path = _get_ws_output_path(output_path, workspace_name, opts["flat"])
+    agent_dir = _get_export_agent_dir(session)
+    ws_output_path = _get_ws_output_path(output_path, workspace_name, opts["flat"], agent_dir)
     _export_session_file(session, ws_output_path, source_tag, opts, stats)
 
 
@@ -15885,6 +15894,7 @@ def _get_export_output_path(
     """
     jsonl_file = session["file"]
     extension = _get_export_extension(output_format)
+    agent_dir = _get_export_agent_dir(session)
 
     if flat:
         output_name = (
@@ -15892,7 +15902,9 @@ def _get_export_output_path(
             if ts_prefix
             else f"{jsonl_file.stem}{extension}"
         )
-        return output_dir / output_name, output_name
+        agent_subdir = output_dir / agent_dir
+        agent_subdir.mkdir(parents=True, exist_ok=True)
+        return agent_subdir / output_name, output_name
 
     source_tag = get_source_tag(remote_host)
     output_name = (
@@ -15901,9 +15913,14 @@ def _get_export_output_path(
         else f"{source_tag}{jsonl_file.stem}{extension}"
     )
     workspace_name = _get_export_workspace_name(session)
-    workspace_subdir = output_dir / workspace_name
+    workspace_subdir = output_dir / agent_dir / workspace_name
     workspace_subdir.mkdir(parents=True, exist_ok=True)
     return workspace_subdir / output_name, output_name
+
+
+def _get_export_agent_dir(session: dict) -> str:
+    """Return the agent-named subdirectory for a session's export path."""
+    return session.get("agent") or detect_agent_from_path(session["file"])
 
 
 def _get_export_workspace_name(session: dict) -> str:
@@ -16213,10 +16230,13 @@ def _html_workspace_output_path(
 ) -> Path:
     """Return output path for a workspace-level HTML bundle."""
     workspace_name = _get_export_workspace_name(session)
+    agent_dir = _get_export_agent_dir(session)
     source_tag = get_source_tag(remote_host)
     if flat:
-        return output_dir / f"{source_tag}{workspace_name}.html"
-    workspace_subdir = output_dir / workspace_name
+        agent_subdir = output_dir / agent_dir
+        agent_subdir.mkdir(parents=True, exist_ok=True)
+        return agent_subdir / f"{source_tag}{workspace_name}.html"
+    workspace_subdir = output_dir / agent_dir / workspace_name
     workspace_subdir.mkdir(parents=True, exist_ok=True)
     return workspace_subdir / (f"{source_tag[:-1]}.html" if source_tag else "index.html")
 
@@ -17590,18 +17610,26 @@ def _classify_session_source(filename: str) -> str:
 
 
 def _scan_workspace_directories(output_dir: Path) -> dict:
-    """Scan workspace directories and group sessions by source."""
+    """Scan agent/workspace directories and group sessions by source.
+
+    Layout is ``output_dir/<agent>/<workspace>/*.md``; workspaces are keyed
+    as ``<agent>/<workspace>`` so the manifest reflects the per-agent split.
+    """
     workspaces = {}
-    for item in output_dir.iterdir():
-        if not item.is_dir():
+    for agent_item in output_dir.iterdir():
+        if not agent_item.is_dir():
             continue
+        for item in agent_item.iterdir():
+            if not item.is_dir():
+                continue
 
-        sessions = list(item.glob("*.md"))
-        sources = {"local": 0, "wsl": 0, "windows": 0, "remote": 0}
-        for session_file in sessions:
-            sources[_classify_session_source(session_file.name)] += 1
+            sessions = list(item.glob("*.md"))
+            sources = {"local": 0, "wsl": 0, "windows": 0, "remote": 0}
+            for session_file in sessions:
+                sources[_classify_session_source(session_file.name)] += 1
 
-        workspaces[item.name] = {"total": len(sessions), "sources": sources, "sessions": sessions}
+            key = f"{agent_item.name}/{item.name}"
+            workspaces[key] = {"total": len(sessions), "sources": sources, "sessions": sessions}
     return workspaces
 
 

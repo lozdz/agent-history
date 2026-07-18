@@ -127,6 +127,7 @@ SECONDS_PER_MINUTE = 60
 EXPORT_FORMAT_MARKDOWN = "markdown"
 EXPORT_FORMAT_HTML = "html"
 DEFAULT_EXPORT_DIR = "./.agent-history/exports"
+DESCRIPTION_SLUG_MAXLEN = 40  # Max chars of first-prompt slug embedded in export filenames
 HTML_SPLIT_SESSION = "session"
 HTML_SPLIT_WORKSPACE = "workspace"
 DETAIL_CONVERSATION_LEVEL = 1
@@ -5846,6 +5847,26 @@ def codex_format_function_result(payload: dict) -> str:
     return f"**[Tool Result]**\nCall ID: `{call_id}`\n```\n{output}\n```"
 
 
+def _annotate_codex_internal_context_messages(messages: list) -> None:
+    """Mark Codex context-injection user records that are not human input.
+
+    Codex injects synthetic ``user`` messages such as ``<environment_context>``,
+    ``<user_instructions>``, and ``<turn_aborted>`` that describe the sandbox or session
+    state rather than carrying a human prompt. Flag them as internal context so they are
+    excluded from end-user-input detection (filename slugs, role labels, stats).
+    """
+    for msg in messages:
+        if msg.get("role") != "user":
+            continue
+        text = str(msg.get("content") or "").lstrip()
+        match = re.match(r"<(environment_context|user_instructions|turn_aborted)>", text)
+        if not match:
+            continue
+        msg["is_internal_context"] = True
+        msg["internal_context_type"] = match.group(1)
+        msg["internal_context_name"] = match.group(1)
+
+
 def codex_read_jsonl_messages(jsonl_file: Path) -> tuple:
     """Read messages from Codex rollout JSONL file.
 
@@ -5911,6 +5932,7 @@ def codex_read_jsonl_messages(jsonl_file: Path) -> tuple:
             except json.JSONDecodeError:
                 continue
 
+    _annotate_codex_internal_context_messages(messages)
     return annotate_message_origins(messages), session_meta
 
 
@@ -12124,13 +12146,42 @@ def _get_export_extension(output_format: str) -> str:
     return ".html" if output_format == EXPORT_FORMAT_HTML else ".md"
 
 
+def _build_description_slug(messages: list) -> str:
+    """Derive a short, filesystem-safe slug from the first human prompt.
+
+    Scans for the first message flagged as genuine end-user input (skips internal
+    skill-context injections and tool-result-bearing user messages), takes its first
+    line, strips path-unsafe and punctuation characters while preserving Unicode word
+    characters (e.g. CJK), and truncates to DESCRIPTION_SLUG_MAXLEN. Returns "" when no
+    human prompt is available, so callers fall back to the plain timestamp/stem name.
+    """
+    text = ""
+    for msg in messages or []:
+        if msg.get("is_end_user_input"):
+            text = str(msg.get("content") or "").strip()
+            if text:
+                break
+    if not text:
+        return ""
+    text = text.splitlines()[0].strip()
+    text = re.sub(r'[\\/:*?"<>|]', " ", text)  # filesystem-illegal characters
+    text = re.sub(r"[^\w\s-]", "", text, flags=re.UNICODE)  # drop remaining punctuation/symbols
+    text = re.sub(r"\s+", "-", text).strip("-.")
+    return text[:DESCRIPTION_SLUG_MAXLEN].strip("-.")
+
+
+def _compose_export_stem(ts_prefix: Optional[str], slug: str, stem: str) -> str:
+    """Join timestamp, description slug, and file stem with underscores, skipping blanks."""
+    return "_".join(part for part in (ts_prefix, slug, stem) if part)
+
+
 def _build_output_filename(
     jsonl_file: Path,
     source_tag: str,
     messages: list,
     output_format: str = EXPORT_FORMAT_MARKDOWN,
 ) -> str:
-    """Build output filename with optional timestamp prefix."""
+    """Build output filename with optional timestamp prefix and description slug."""
     ts_prefix = None
     extension = _get_export_extension(output_format)
     if messages and messages[0].get("timestamp"):
@@ -12139,11 +12190,8 @@ def _build_output_filename(
             ts_prefix = dt.strftime("%Y%m%d%H%M%S")
         except (ValueError, AttributeError):
             pass
-    return (
-        f"{source_tag}{ts_prefix}_{jsonl_file.stem}{extension}"
-        if ts_prefix
-        else f"{source_tag}{jsonl_file.stem}{extension}"
-    )
+    slug = _build_description_slug(messages)
+    return f"{source_tag}{_compose_export_stem(ts_prefix, slug, jsonl_file.stem)}{extension}"
 
 
 def _write_export_parts(
@@ -15886,6 +15934,7 @@ def _get_export_output_path(
     flat: bool,
     remote_host: Optional[str],
     output_format: str = EXPORT_FORMAT_MARKDOWN,
+    slug: str = "",
 ) -> tuple:
     """Get output path and name for export file.
 
@@ -15895,23 +15944,16 @@ def _get_export_output_path(
     jsonl_file = session["file"]
     extension = _get_export_extension(output_format)
     agent_dir = _get_export_agent_dir(session)
+    stem = _compose_export_stem(ts_prefix, slug, jsonl_file.stem)
 
     if flat:
-        output_name = (
-            f"{ts_prefix}_{jsonl_file.stem}{extension}"
-            if ts_prefix
-            else f"{jsonl_file.stem}{extension}"
-        )
+        output_name = f"{stem}{extension}"
         agent_subdir = output_dir / agent_dir
         agent_subdir.mkdir(parents=True, exist_ok=True)
         return agent_subdir / output_name, output_name
 
     source_tag = get_source_tag(remote_host)
-    output_name = (
-        f"{source_tag}{ts_prefix}_{jsonl_file.stem}{extension}"
-        if ts_prefix
-        else f"{source_tag}{jsonl_file.stem}{extension}"
-    )
+    output_name = f"{source_tag}{stem}{extension}"
     workspace_name = _get_export_workspace_name(session)
     workspace_subdir = output_dir / agent_dir / workspace_name
     workspace_subdir.mkdir(parents=True, exist_ok=True)
@@ -16069,8 +16111,9 @@ def _export_sessions(sessions: list, args, output_dir: Path):  # noqa: C901
             return
 
         ts_prefix = _extract_timestamp_prefix(messages)
+        slug = _build_description_slug(messages)
         output_file, output_name = _get_export_output_path(
-            session, ts_prefix, output_dir, flat, remote_host, output_format
+            session, ts_prefix, output_dir, flat, remote_host, output_format, slug
         )
 
         up_to_date = _is_export_up_to_date(output_file, jsonl_file, force)

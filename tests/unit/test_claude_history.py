@@ -717,6 +717,49 @@ class TestCodexJSONLReading:
         assert messages == []
         assert meta is None
 
+    def test_environment_context_marked_internal(self, tmp_path):
+        """Codex <environment_context> user blocks are internal context, not human input."""
+        session_file = tmp_path / "codex.jsonl"
+        lines = [
+            {
+                "timestamp": "2026-07-02T09:25:34.000Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": "<environment_context>\n<cwd>/tmp</cwd>\n</env>",
+                        }
+                    ],
+                },
+            },
+            {
+                "timestamp": "2026-07-02T09:25:40.000Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Write a reboot test script"}],
+                },
+            },
+        ]
+        session_file.write_text(
+            "\n".join(json.dumps(line) for line in lines), encoding="utf-8"
+        )
+
+        messages, _ = ch.codex_read_jsonl_messages(session_file)
+        env_msg, human_msg = messages[0], messages[1]
+
+        assert env_msg["is_internal_context"] is True
+        assert env_msg["internal_context_type"] == "environment_context"
+        assert env_msg["is_end_user_input"] is False
+        assert human_msg["is_end_user_input"] is True
+
+        # The filename slug should reflect the real prompt, not the env context.
+        assert ch._build_description_slug(messages) == "Write-a-reboot-test-script"
+
 
 class TestCodexTimestamp:
     """Tests for codex_get_first_timestamp."""
@@ -10711,7 +10754,7 @@ class TestExportIncremental:
         )
 
         ch.cmd_batch(args)
-        md_files = list(output_dir.glob("*.md"))
+        md_files = list(output_dir.glob("claude/*.md"))
         assert len(md_files) == 1
         export_file = md_files[0]
         first_mtime = export_file.stat().st_mtime
@@ -13866,6 +13909,88 @@ class TestExportPathHandling:
         # Subdirectory should be created under the per-agent dir (claude for .jsonl).
         # For "-home-user-myproject", the workspace name is "user-myproject"
         assert (tmp_path / "claude" / "user-myproject").exists()
+
+    def test_export_path_embeds_description_slug(self, tmp_path):
+        """Slug is inserted between timestamp and stem when provided."""
+        session = {
+            "file": Path("/some/path/session-abc.jsonl"),
+            "workspace": "-home-user-project",
+        }
+        output_file, output_name = ch._get_export_output_path(
+            session,
+            "20251201120000",
+            tmp_path,
+            flat=True,
+            remote_host=None,
+            slug="fix-login-bug",
+        )
+        assert output_name == "20251201120000_fix-login-bug_session-abc.md"
+        assert output_file == tmp_path / "claude" / output_name
+
+    def test_export_path_slug_without_timestamp(self, tmp_path):
+        """Slug still applies when no timestamp prefix is available."""
+        session = {
+            "file": Path("/some/path/session-abc.jsonl"),
+            "workspace": "-home-user-project",
+        }
+        _, output_name = ch._get_export_output_path(
+            session, None, tmp_path, flat=True, remote_host=None, slug="fix-login-bug"
+        )
+        assert output_name == "fix-login-bug_session-abc.md"
+
+
+class TestDescriptionSlug:
+    """Test _build_description_slug derives readable slugs from the first prompt."""
+
+    def test_basic_prompt(self):
+        messages = [{"is_end_user_input": True, "content": "Fix the login bug please"}]
+        assert ch._build_description_slug(messages) == "Fix-the-login-bug-please"
+
+    def test_unicode_prompt_preserved(self):
+        messages = [{"is_end_user_input": True, "content": "анализ amd драйвера"}]
+        assert ch._build_description_slug(messages) == "анализ-amd-драйвера"
+
+    def test_uses_first_line_only(self):
+        messages = [
+            {"is_end_user_input": True, "content": "First line question\nsecond line\nthird"}
+        ]
+        assert ch._build_description_slug(messages) == "First-line-question"
+
+    def test_strips_punctuation_and_path_chars(self):
+        messages = [
+            {"is_end_user_input": True, "content": 'What/is: this? "weird" <name>|thing'}
+        ]
+        slug = ch._build_description_slug(messages)
+        assert "/" not in slug and ":" not in slug and '"' not in slug
+        assert slug == "What-is-this-weird-name-thing"
+
+    def test_truncates_to_maxlen(self):
+        long_prompt = "word " * 50
+        messages = [{"is_end_user_input": True, "content": long_prompt}]
+        slug = ch._build_description_slug(messages)
+        assert len(slug) <= ch.DESCRIPTION_SLUG_MAXLEN
+
+    def test_skips_non_human_input(self):
+        messages = [
+            {"is_end_user_input": False, "content": "tool result payload"},
+            {"is_end_user_input": True, "content": "the real question"},
+        ]
+        assert ch._build_description_slug(messages) == "the-real-question"
+
+    def test_empty_when_no_human_input(self):
+        messages = [{"is_end_user_input": False, "content": "tool output only"}]
+        assert ch._build_description_slug(messages) == ""
+
+    def test_empty_messages(self):
+        assert ch._build_description_slug([]) == ""
+        assert ch._build_description_slug(None) == ""
+
+    def test_whitespace_only_prompt_falls_through(self):
+        messages = [
+            {"is_end_user_input": True, "content": "   \n  "},
+            {"is_end_user_input": True, "content": "actual content"},
+        ]
+        assert ch._build_description_slug(messages) == "actual-content"
 
 
 # ============================================================================

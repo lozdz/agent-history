@@ -439,13 +439,13 @@ The file is organized into many sections (36+), grouped into these high-level ca
                 ↓
     ./exports/                          (organized output - default)
         └── myapp/                      (workspace subdirectory)
-            ├── 20251120_<uuid>.md      (local Windows - no prefix)
-            ├── wsl_ubuntu_20251120_<uuid>.md  (WSL)
-            └── remote_vm01_20251120_<uuid>.md (SSH remote)
+            ├── 20251120_Fix-login-bug_<uuid>.md      (local Windows - no prefix)
+            ├── wsl_ubuntu_20251120_Analyze-driver-error_<uuid>.md  (WSL)
+            └── remote_vm01_20251120_Deploy-api_<uuid>.md (SSH remote)
 
     OR with --flat flag:
     ./exports/                          (flat output)
-        └── 20251120_<uuid>.md          (all files in one directory)
+        └── 20251120_Fix-login-bug_<uuid>.md          (all files in one directory)
 ```
 
 ### Organized Export Structure (Default)
@@ -456,9 +456,9 @@ The file is organized into many sections (36+), grouped into these high-level ca
 ```
 exports/
   ├── workspace-name/
-  │   ├── 20251120_session.md              ← Local (no prefix)
-  │   ├── wsl_ubuntu_20251120_session.md   ← WSL Ubuntu
-  │   └── remote_vm01_20251120_session.md  ← SSH remote
+  │   ├── 20251120_Fix-login-bug_session.md              ← Local (no prefix)
+  │   ├── wsl_ubuntu_20251120_Analyze-driver-error_session.md   ← WSL Ubuntu
+  │   └── remote_vm01_20251120_Deploy-api_session.md  ← SSH remote
   └── another-workspace/
       └── ...
 ```
@@ -746,36 +746,52 @@ if not force and output_file.exists():
 
 ### Output Filename Format
 
-Exported markdown files are named using the timestamp of the first message in the conversation:
+Exported files include a human-readable description slug derived from the first user prompt, making conversations easy to identify at a glance while remaining chronologically sortable.
 
-**Format:** `yyyymmddhhmmss_original-stem.md`
+**Format:** `yyyymmddhhmmss_description-slug_original-stem.md`
 
 **Examples:**
-- `20251120103045_c7e6fbcb-6a8a-4637-ab33-6075d83060a8.md`
-- `20251120150230_agent-c17c2c4d.md`
+- `20251120103045_Analyze-amd-driver-load-error_c7e6fbcb-6a8a-4637-ab33-6075d83060a8.md`
+- `20251120150230_Fix-the-login-bug_agent-c17c2c4d.md`
 
-**Implementation** (in `cmd_export()`):
+**Slug derivation:**
+- Extracted from the first genuine human prompt (skips internal tool results and context injections)
+- First line only, truncated to 40 characters
+- Preserves Unicode (CJK, etc.); strips punctuation and filesystem-unsafe characters
+- Falls back to the plain timestamp/stem format when no human prompt is available
+
+**Implementation:**
 ```python
-# Extract first timestamp from JSONL file
-first_ts = get_first_timestamp(jsonl_file)
-if first_ts:
-    # Parse ISO 8601 timestamp and format as yyyymmddhhmmss
-    dt = datetime.fromisoformat(first_ts.replace('Z', '+00:00'))
-    ts_prefix = dt.strftime('%Y%m%d%H%M%S')
-    output_name = f"{ts_prefix}_{jsonl_file.stem}.md"
-else:
-    # Fallback: use original stem if no timestamp found
-    output_name = f"{jsonl_file.stem}.md"
+def _build_description_slug(messages: list) -> str:
+    """Derive a short, filesystem-safe slug from the first human prompt."""
+    text = ""
+    for msg in messages or []:
+        if msg.get("is_end_user_input"):
+            text = str(msg.get("content") or "").strip()
+            if text:
+                break
+    if not text:
+        return ""
+    text = text.splitlines()[0].strip()
+    text = re.sub(r'[\\/:*?"<>|]', " ", text)  # filesystem-illegal chars
+    text = re.sub(r"[^\w\s-]", "", text, flags=re.UNICODE)  # punctuation
+    text = re.sub(r"\s+", "-", text).strip("-.")
+    return text[:DESCRIPTION_SLUG_MAXLEN].strip("-.")
 ```
 
 **Benefits:**
-- Chronological sorting: Files automatically sort by conversation start time
-- Quick identification: See when a conversation started without opening the file
-- Preserves original ID: Full session UUID is retained for reference
-- Handles edge cases: Falls back to original filename if no timestamp exists
+- Self-describing: Filenames convey conversation topic without opening the file
+- Chronological sorting: Timestamp prefix keeps files in order
+- Unique identification: Full session UUID retained for traceability
+- Multi-language support: Chinese, Japanese, and other scripts preserved
+- Incremental export: Slug is deterministic, so re-exports skip unchanged files
 
-**Helper function:**
-- `get_first_timestamp(jsonl_file)`: Efficiently scans the JSONL file to extract the timestamp from the first user or assistant message
+**Helper functions:**
+- `_build_description_slug(messages)`: Extracts and sanitizes the first human prompt
+- `_extract_timestamp_prefix(messages)`: Extracts timestamp from first message
+- `_compose_export_stem(ts, slug, stem)`: Assembles filename components
+
+**Migration note:** The first export run after this feature creates new filenames. Previously-exported files (old `{ts}_{uuid}.md` format) won't match the new names and will be re-exported once.
 
 ### Date Filtering
 

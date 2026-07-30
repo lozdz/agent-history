@@ -2133,6 +2133,15 @@ def _claude_message_text_from_blocks(msg: dict) -> str:
     ).strip()
 
 
+# Harness-injected XML block prefixes that are never human-typed content.
+_CLAUDE_HARNESS_XML_PREFIXES = (
+    "<local-command-caveat>",
+    "<command-name>",
+    "<local-command-stdout>",
+    "<task-notification>",
+)
+
+
 def _annotate_claude_internal_context_messages(messages: list) -> None:
     """Mark Claude context-injection records that are not human user input."""
     uuid_to_message = {msg.get("uuid"): msg for msg in messages if msg.get("uuid")}
@@ -2140,6 +2149,10 @@ def _annotate_claude_internal_context_messages(messages: list) -> None:
         if msg.get("role") != "user":
             continue
         text = _claude_message_text_from_blocks(msg)
+        if any(text.startswith(prefix) for prefix in _CLAUDE_HARNESS_XML_PREFIXES):
+            msg["is_internal_context"] = True
+            msg["internal_context_type"] = "harness_injection"
+            continue
         if not text.startswith("Base directory for this skill:"):
             continue
 

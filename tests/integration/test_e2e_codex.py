@@ -278,6 +278,53 @@ class TestCodexExport:
         content = md_files[0].read_text()
         assert "# Codex Conversation" in content, f"Missing Codex title in: {content[:500]}"
 
+    def test_export_filename_skips_agents_md_instructions(self, tmp_path: Path):
+        """Export filenames should describe the prompt, not injected repository rules."""
+        messages = [
+            {
+                "timestamp": "2025-01-15T10:00:02.000Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": (
+                                "# AGENTS.md instructions for /home/user/project\n\n"
+                                "<INSTRUCTIONS>\nFollow repository rules.\n</INSTRUCTIONS>"
+                            ),
+                        }
+                    ],
+                },
+            },
+            {
+                "timestamp": "2025-01-15T10:00:03.000Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "Fix Codex export filenames"}
+                    ],
+                },
+            },
+        ]
+        make_codex_session(tmp_path, "2025-01-15", "agents-md-slug-test", messages)
+        outdir = tmp_path / "output"
+        outdir.mkdir()
+
+        result = run_cli(
+            ["--agent", "codex", "export", "--local", "-o", str(outdir), "--force", "--aw"],
+            env=setup_env(tmp_path),
+        )
+
+        assert result.returncode == 0, f"Export failed: {result.stderr}"
+        names = {path.name for path in outdir.rglob("*.md")}
+        assert names == {
+            "20250115100002_Fix-Codex-export-filenames_rollout-agents-md-slug-test.md"
+        }
+
     def test_export_codex_markdown_structure(self, tmp_path: Path):
         """Verify Codex export has correct markdown structure with tool calls."""
         # Create session with tool call

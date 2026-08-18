@@ -5864,20 +5864,24 @@ def _annotate_codex_internal_context_messages(messages: list) -> None:
     """Mark Codex context-injection user records that are not human input.
 
     Codex injects synthetic ``user`` messages such as ``<environment_context>``,
-    ``<user_instructions>``, and ``<turn_aborted>`` that describe the sandbox or session
-    state rather than carrying a human prompt. Flag them as internal context so they are
-    excluded from end-user-input detection (filename slugs, role labels, stats).
+    ``<user_instructions>``, ``<turn_aborted>``, and the Markdown wrapper used to pass
+    repository ``AGENTS.md`` instructions. These describe the sandbox or session state
+    rather than carrying a human prompt. Flag them as internal context so they are excluded
+    from end-user-input detection (filename slugs, role labels, stats).
     """
     for msg in messages:
         if msg.get("role") != "user":
             continue
         text = str(msg.get("content") or "").lstrip()
         match = re.match(r"<(environment_context|user_instructions|turn_aborted)>", text)
-        if not match:
+        context_type = match.group(1) if match else None
+        if re.match(r"# AGENTS\.md instructions for(?:\s|$)", text):
+            context_type = "agents_md"
+        if not context_type:
             continue
         msg["is_internal_context"] = True
-        msg["internal_context_type"] = match.group(1)
-        msg["internal_context_name"] = match.group(1)
+        msg["internal_context_type"] = context_type
+        msg["internal_context_name"] = context_type
 
 
 def codex_read_jsonl_messages(jsonl_file: Path) -> tuple:

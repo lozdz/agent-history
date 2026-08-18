@@ -760,6 +760,53 @@ class TestCodexJSONLReading:
         # The filename slug should reflect the real prompt, not the env context.
         assert ch._build_description_slug(messages) == "Write-a-reboot-test-script"
 
+    def test_agents_md_instructions_do_not_supply_export_filename_slug(self, tmp_path):
+        """Codex AGENTS.md injection is internal context, not the filename description."""
+        session_file = tmp_path / "rollout-test.jsonl"
+        lines = [
+            {
+                "timestamp": "2026-08-18T01:45:34.790Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": (
+                                "# AGENTS.md instructions for /home/user/project\n\n"
+                                "<INSTRUCTIONS>\nFollow the repository rules.\n</INSTRUCTIONS>"
+                            ),
+                        }
+                    ],
+                },
+            },
+            {
+                "timestamp": "2026-08-18T01:45:35.000Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": "Fix Codex session export filenames",
+                        }
+                    ],
+                },
+            },
+        ]
+        session_file.write_text(
+            "\n".join(json.dumps(line) for line in lines), encoding="utf-8"
+        )
+
+        messages, _ = ch.codex_read_jsonl_messages(session_file)
+        output_name = ch._build_output_filename(session_file, "", messages)
+
+        assert messages[0]["is_internal_context"] is True
+        assert messages[0]["internal_context_type"] == "agents_md"
+        assert output_name == "20260818014534_Fix-Codex-session-export-filenames_rollout-test.md"
+
 
 class TestClaudeHarnessInjectionAnnotation:
     """Claude harness-injected XML blocks should be marked as internal context."""

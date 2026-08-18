@@ -278,8 +278,8 @@ class TestCodexExport:
         content = md_files[0].read_text()
         assert "# Codex Conversation" in content, f"Missing Codex title in: {content[:500]}"
 
-    def test_export_filename_skips_agents_md_instructions(self, tmp_path: Path):
-        """Export filenames should describe the prompt, not injected repository rules."""
+    def test_export_filename_skips_bare_agents_md_instructions(self, tmp_path: Path):
+        """Export filenames should skip Codex's bare AGENTS.md injection."""
         messages = [
             {
                 "timestamp": "2025-01-15T10:00:02.000Z",
@@ -291,10 +291,18 @@ class TestCodexExport:
                         {
                             "type": "input_text",
                             "text": (
-                                "# AGENTS.md instructions for /home/user/project\n\n"
+                                "# AGENTS.md instructions\n\n"
                                 "<INSTRUCTIONS>\nFollow repository rules.\n</INSTRUCTIONS>"
                             ),
-                        }
+                        },
+                        {
+                            "type": "input_text",
+                            "text": (
+                                "<environment_context>\n"
+                                "<cwd>/home/user/project</cwd>\n"
+                                "</environment_context>"
+                            ),
+                        },
                     ],
                 },
             },

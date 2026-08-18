@@ -5875,7 +5875,11 @@ def _annotate_codex_internal_context_messages(messages: list) -> None:
         text = str(msg.get("content") or "").lstrip()
         match = re.match(r"<(environment_context|user_instructions|turn_aborted)>", text)
         context_type = match.group(1) if match else None
-        if re.match(r"# AGENTS\.md instructions for(?:\s|$)", text):
+        # Codex emits both a bare heading and a path-qualified heading.
+        # Keep the check anchored to the first line so ordinary user prompts
+        # mentioning AGENTS.md are not classified as injected context.
+        first_line = text.splitlines()[0].strip() if text else ""
+        if re.fullmatch(r"# AGENTS\.md instructions(?: for(?:\s+.*)?)?", first_line):
             context_type = "agents_md"
         if not context_type:
             continue

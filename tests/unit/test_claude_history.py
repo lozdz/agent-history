@@ -807,6 +807,58 @@ class TestCodexJSONLReading:
         assert messages[0]["internal_context_type"] == "agents_md"
         assert output_name == "20260818014534_Fix-Codex-session-export-filenames_rollout-test.md"
 
+    def test_bare_agents_md_instructions_do_not_supply_export_filename_slug(self, tmp_path):
+        """Codex's bare AGENTS.md heading is also internal context."""
+        session_file = tmp_path / "rollout-bare-agents-md.jsonl"
+        lines = [
+            {
+                "timestamp": "2026-08-18T01:37:35.712Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": (
+                                "# AGENTS.md instructions\n\n"
+                                "<INSTRUCTIONS>\nFollow repository rules.\n</INSTRUCTIONS>"
+                            ),
+                        },
+                        {
+                            "type": "input_text",
+                            "text": (
+                                "<environment_context>\n"
+                                "<cwd>/tmp/project</cwd>\n"
+                                "</environment_context>"
+                            ),
+                        },
+                    ],
+                },
+            },
+            {
+                "timestamp": "2026-08-18T01:37:36.000Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "Fix the export filename"}
+                    ],
+                },
+            },
+        ]
+        session_file.write_text(
+            "\n".join(json.dumps(line) for line in lines), encoding="utf-8"
+        )
+
+        messages, _ = ch.codex_read_jsonl_messages(session_file)
+        output_name = ch._build_output_filename(session_file, "", messages)
+
+        assert messages[0]["is_internal_context"] is True
+        assert messages[0]["internal_context_type"] == "agents_md"
+        assert output_name == "20260818013735_Fix-the-export-filename_rollout-bare-agents-md.md"
+
 
 class TestClaudeHarnessInjectionAnnotation:
     """Claude harness-injected XML blocks should be marked as internal context."""

@@ -20,6 +20,7 @@ import importlib.util
 import json
 import os
 import platform
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -16258,6 +16259,550 @@ class TestDatabaseEdgeCases:
 
 
 # ============================================================================
+# ============================================================================
+# Minimal Export Filtering Tests
+# ============================================================================
+
+
+class TestMinimalExportFiltering:
+    """--minimal exports omit harness-injected internal context for all agents."""
+
+    def _write_codex_session(self, tmp_path):
+        """Codex session mixing harness injections with real conversation."""
+        lines = [
+            {
+                "timestamp": "2026-04-01T07:47:38.000Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": "codex-session",
+                    "cwd": "/home/user/project",
+                    "cli_version": "0.65.0",
+                    "source": "cli",
+                },
+            },
+            {
+                "timestamp": "2026-04-01T07:47:39.000Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": (
+                                "# AGENTS.md instructions\n\n<INSTRUCTIONS>\n"
+                                "Follow the repository rules.\n</INSTRUCTIONS>"
+                            ),
+                        }
+                    ],
+                },
+            },
+            {
+                "timestamp": "2026-04-01T07:47:40.000Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": "<environment_context>\n  <cwd>/home/user/project</cwd>\n</environment_context>",
+                        }
+                    ],
+                },
+            },
+            {
+                "timestamp": "2026-04-01T07:47:41.000Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "developer",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": "<skills_instructions>\n### Available skills\n- imagegen\n</skills_instructions>",
+                        }
+                    ],
+                },
+            },
+            {
+                "timestamp": "2026-04-01T07:47:42.000Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "developer",
+                    "content": [
+                        {"type": "input_text", "text": "You are the primary agent in a team."}
+                    ],
+                },
+            },
+            {
+                "timestamp": "2026-04-01T07:47:43.000Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Fix the login bug"}],
+                },
+            },
+            {
+                "timestamp": "2026-04-01T07:47:44.000Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "I will inspect the auth code."}],
+                },
+            },
+        ]
+        session_file = tmp_path / "rollout-2026-04-01T07-47-38-abc123.jsonl"
+        session_file.write_text("\n".join(json.dumps(line) for line in lines), encoding="utf-8")
+        return session_file
+
+    def test_codex_minimal_omits_harness_and_system_messages(self, tmp_path):
+        """Minimal Codex export keeps only real conversation content."""
+        session_file = self._write_codex_session(tmp_path)
+
+        md_minimal = ch.codex_parse_jsonl_to_markdown(session_file, minimal=True)
+        md_full = ch.codex_parse_jsonl_to_markdown(session_file, minimal=False)
+
+        # Real conversation survives minimal mode.
+        assert "Fix the login bug" in md_minimal
+        assert "I will inspect the auth code." in md_minimal
+        # Harness injections are omitted in minimal mode.
+        assert "AGENTS.md instructions" not in md_minimal
+        assert "environment_context" not in md_minimal
+        assert "skills_instructions" not in md_minimal
+        assert "Available skills" not in md_minimal
+        assert "primary agent" not in md_minimal
+        # Non-minimal export keeps everything (zero information loss).
+        assert "AGENTS.md instructions" in md_full
+        assert "skills_instructions" in md_full
+        assert "primary agent" in md_full
+
+    def test_codex_minimal_renumbers_messages(self, tmp_path):
+        """Minimal export message numbers are contiguous, count matches header."""
+        session_file = self._write_codex_session(tmp_path)
+
+        md = ch.codex_parse_jsonl_to_markdown(session_file, minimal=True)
+
+        assert "**Messages:** 2" in md
+        assert "## User (Message 1)" in md
+        assert "## Assistant (Message 2)" in md
+        assert "Message 3" not in md
+
+    def test_claude_minimal_omits_harness_injections(self, tmp_path):
+        """Minimal Claude export omits harness XML injections, keeps prompts."""
+        entries = [
+            {
+                "type": "user",
+                "timestamp": "2026-07-30T00:00:00.000Z",
+                "cwd": "/home/user/project",
+                "message": {
+                    "role": "user",
+                    "content": "<task-notification>Task done</task-notification>",
+                },
+            },
+            {
+                "type": "user",
+                "timestamp": "2026-07-30T00:00:05.000Z",
+                "cwd": "/home/user/project",
+                "message": {"role": "user", "content": "Fix the login bug"},
+            },
+            {
+                "type": "assistant",
+                "timestamp": "2026-07-30T00:01:00.000Z",
+                "message": {"role": "assistant", "content": [{"type": "text", "text": "On it."}]},
+            },
+        ]
+        session_file = tmp_path / "session.jsonl"
+        session_file.write_text("\n".join(json.dumps(e) for e in entries), encoding="utf-8")
+
+        md_minimal = ch.parse_jsonl_to_markdown(session_file, minimal=True)
+        md_full = ch.parse_jsonl_to_markdown(session_file, minimal=False)
+
+        assert "task-notification" not in md_minimal
+        assert "Fix the login bug" in md_minimal
+        assert "On it." in md_minimal
+        assert "**Messages:** 2" in md_minimal
+        assert "task-notification" in md_full
+        assert "**Messages:** 3" in md_full
+
+    def test_gemini_minimal_omits_info_messages(self, tmp_path):
+        """Minimal Gemini export omits CLI info notices."""
+        session = {
+            "sessionId": "gemini-session",
+            "projectHash": "abc123",
+            "startTime": "2025-12-08T10:30:00.000Z",
+            "lastUpdated": "2025-12-08T11:00:00.000Z",
+            "messages": [
+                {
+                    "type": "info",
+                    "content": "Loaded MCP servers",
+                    "timestamp": "2025-12-08T10:29:00.000Z",
+                },
+                {
+                    "type": "user",
+                    "content": "Hello Gemini",
+                    "timestamp": "2025-12-08T10:30:00.000Z",
+                },
+                {
+                    "type": "gemini",
+                    "content": "Hello!",
+                    "timestamp": "2025-12-08T10:30:05.000Z",
+                },
+            ],
+        }
+        json_file = tmp_path / "session.json"
+        json_file.write_text(json.dumps(session), encoding="utf-8")
+
+        md_minimal = ch.gemini_parse_json_to_markdown(json_file, minimal=True)
+        md_full = ch.gemini_parse_json_to_markdown(json_file, minimal=False)
+
+        assert "Loaded MCP servers" not in md_minimal
+        assert "Hello Gemini" in md_minimal
+        assert "Loaded MCP servers" in md_full
+
+    def test_pi_minimal_omits_compaction_summary(self, tmp_path):
+        """Minimal Pi export omits compaction summaries."""
+        records = [
+            {
+                "type": "session",
+                "id": "pi-session",
+                "version": "v3",
+                "cwd": "/home/user/project",
+                "createdAt": "2026-01-01T10:00:00Z",
+            },
+            {
+                "type": "compaction",
+                "id": "c1",
+                "timestamp": "2026-01-01T10:00:30Z",
+                "summary": "Summary of earlier conversation",
+                "tokensBefore": 1000,
+            },
+            {
+                "type": "message",
+                "id": "u1",
+                "timestamp": "2026-01-01T10:00:31Z",
+                "message": {"role": "user", "content": [{"type": "text", "text": "Hello Pi"}]},
+            },
+        ]
+        session_file = tmp_path / "session.jsonl"
+        session_file.write_text("\n".join(json.dumps(r) for r in records), encoding="utf-8")
+
+        md_minimal = ch.pi_parse_jsonl_to_markdown(session_file, minimal=True)
+        md_full = ch.pi_parse_jsonl_to_markdown(session_file, minimal=False)
+
+        assert "Summary of earlier conversation" not in md_minimal
+        assert "Hello Pi" in md_minimal
+        assert "Summary of earlier conversation" in md_full
+
+    def test_minimal_split_parts_filter_internal_context(self, tmp_path):
+        """Split parts honor the minimal filter with contiguous numbering."""
+        entries = [
+            {
+                "type": "user",
+                "timestamp": "2026-07-30T00:00:00.000Z",
+                "cwd": "/home/user/project",
+                "message": {
+                    "role": "user",
+                    "content": "<local-command-stdout>ok</local-command-stdout>",
+                },
+            }
+        ]
+        for i in range(6):
+            entries.append(
+                {
+                    "type": "user",
+                    "timestamp": f"2026-07-30T00:0{i}:00.000Z",
+                    "cwd": "/home/user/project",
+                    "message": {"role": "user", "content": f"Prompt number {i}"},
+                }
+            )
+            entries.append(
+                {
+                    "type": "assistant",
+                    "timestamp": f"2026-07-30T00:0{i}:30.000Z",
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": f"Reply number {i} " * 50}],
+                    },
+                }
+            )
+        session_file = tmp_path / "session.jsonl"
+        session_file.write_text("\n".join(json.dumps(e) for e in entries), encoding="utf-8")
+
+        messages = ch.read_jsonl_messages(session_file, quiet=True)
+        parts = ch.generate_markdown_parts(messages, session_file, minimal=True, split_lines=30)
+
+        assert parts
+        all_md = "\n".join(part[2] for part in parts)
+        assert "local-command-stdout" not in all_md
+        assert "Prompt number 0" in all_md
+        # Numbering stays contiguous within each part (no gaps from filtering).
+        for _, _, part_md, _, _ in parts:
+            numbers = [int(n) for n in re.findall(r"## Message (\d+)", part_md)]
+            assert numbers == list(range(numbers[0], numbers[0] + len(numbers)))
+
+    def test_render_markdown_document_minimal_level_filters(self, tmp_path):
+        """Concise markdown levels apply the minimal filter too."""
+        session_file = self._write_codex_session(tmp_path)
+        messages, _ = ch.codex_read_jsonl_messages(session_file)
+
+        md = ch.render_markdown_document(
+            session_file, ch.AGENT_CODEX, messages, minimal=True, markdown_level=2
+        )
+
+        assert "Fix the login bug" in md
+        assert "skills_instructions" not in md
+        assert "Available skills" not in md
+
+
+# ============================================================================
+# Session Header Field Tests (File/Project/Messages/First/Last)
+# ============================================================================
+
+
+class TestSessionHeaderFields:
+    """All agents export File/Project/Messages/First/Last header fields."""
+
+    def test_codex_markdown_header_fields(self, temp_codex_session_file):
+        """Codex header shows File/Project/Messages/First/Last in order."""
+        md = ch.codex_parse_jsonl_to_markdown(temp_codex_session_file)
+
+        assert "**File:** rollout-2025-12-08T00-37-46-test.jsonl" in md
+        assert "**Project:** /home/user/project" in md
+        assert "**Messages:** 4" in md
+        assert "**First message:** 2025-12-08T00:39:54.852Z" in md
+        assert "**Last message:** 2025-12-08T00:40:05.000Z" in md
+        assert md.index("**File:**") < md.index("**Project:**") < md.index("**Messages:**")
+
+    def test_codex_header_fields_in_minimal_mode(self, temp_codex_session_file):
+        """Header fields are present even in minimal mode."""
+        md = ch.codex_parse_jsonl_to_markdown(temp_codex_session_file, minimal=True)
+
+        assert "**File:** rollout-2025-12-08T00-37-46-test.jsonl" in md
+        assert "**Project:** /home/user/project" in md
+        assert "**Messages:**" in md
+
+    def test_codex_header_uses_display_file(self, tmp_path):
+        """display_file overrides the source filename in the header."""
+        session_file = tmp_path / "rollout-2026-04-01T07-47-38-abc.jsonl"
+        session_file.write_text(
+            json.dumps(
+                {
+                    "timestamp": "2026-04-01T07:47:38.000Z",
+                    "type": "session_meta",
+                    "payload": {"id": "s", "cwd": "/home/user/project"},
+                }
+            )
+            + "\n"
+            + json.dumps(
+                {
+                    "timestamp": "2026-04-01T07:47:43.000Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "Hello"}],
+                    },
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        md = ch.codex_parse_jsonl_to_markdown(session_file, display_file="remote-session.jsonl")
+
+        assert "**File:** remote-session.jsonl" in md
+        assert "**Project:** /home/user/project" in md
+
+    def test_codex_get_session_cwd(self, temp_codex_session_file):
+        """codex_get_session_cwd reads cwd from the session_meta line."""
+        assert ch.codex_get_session_cwd(temp_codex_session_file) == "/home/user/project"
+
+    def test_gemini_markdown_header_fields(self, tmp_path, sample_gemini_session):
+        """Gemini header shows the five fields; Project falls back to the hash."""
+        hash_dir = tmp_path / "abc123hash789" / "chats"
+        hash_dir.mkdir(parents=True)
+        json_file = hash_dir / "session.json"
+        json_file.write_text(json.dumps(sample_gemini_session), encoding="utf-8")
+
+        md = ch.gemini_parse_json_to_markdown(json_file)
+
+        assert "**File:** session.json" in md
+        assert "**Project:** abc123hash789" in md
+        assert "**Messages:** 2" in md
+        assert "**First message:** 2025-12-08T10:30:00.000Z" in md
+        assert "**Last message:** 2025-12-08T10:30:05.000Z" in md
+
+    def test_pi_markdown_header_fields(self, tmp_path):
+        """Pi header shows the five fields with the session working directory."""
+        records = [
+            {
+                "type": "session",
+                "id": "pi-session",
+                "version": "v3",
+                "cwd": "/home/user/project",
+                "createdAt": "2026-01-01T10:00:00Z",
+            },
+            {
+                "type": "message",
+                "id": "u1",
+                "timestamp": "2026-01-01T10:00:01Z",
+                "message": {"role": "user", "content": [{"type": "text", "text": "Hello Pi"}]},
+            },
+        ]
+        session_file = tmp_path / "session.jsonl"
+        session_file.write_text("\n".join(json.dumps(r) for r in records), encoding="utf-8")
+
+        md = ch.pi_parse_jsonl_to_markdown(session_file)
+
+        assert "**File:** session.jsonl" in md
+        assert "**Project:** /home/user/project" in md
+        assert "**Messages:** 1" in md
+        assert "**First message:** 2026-01-01T10:00:01Z" in md
+
+    def test_claude_markdown_header_includes_project(self, tmp_path):
+        """Claude header shows Project from the first message cwd, after File."""
+        entries = [
+            {
+                "type": "user",
+                "timestamp": "2026-07-30T00:00:00.000Z",
+                "cwd": "/home/user/project",
+                "message": {"role": "user", "content": "Fix the login bug"},
+            },
+            {
+                "type": "assistant",
+                "timestamp": "2026-07-30T00:01:00.000Z",
+                "message": {"role": "assistant", "content": [{"type": "text", "text": "On it."}]},
+            },
+        ]
+        session_file = tmp_path / "session.jsonl"
+        session_file.write_text("\n".join(json.dumps(e) for e in entries), encoding="utf-8")
+
+        md = ch.parse_jsonl_to_markdown(session_file)
+
+        assert "**File:** session.jsonl" in md
+        assert "**Project:** /home/user/project" in md
+        assert "**Messages:** 2" in md
+        assert md.index("**File:**") < md.index("**Project:**") < md.index("**Messages:**")
+
+    def test_claude_split_header_includes_project(self, tmp_path):
+        """Split-part headers also carry the Project field."""
+        entries = []
+        for i in range(6):
+            entries.append(
+                {
+                    "type": "user",
+                    "timestamp": f"2026-07-30T00:0{i}:00.000Z",
+                    "cwd": "/home/user/project",
+                    "message": {"role": "user", "content": f"Prompt number {i}"},
+                }
+            )
+            entries.append(
+                {
+                    "type": "assistant",
+                    "timestamp": f"2026-07-30T00:0{i}:30.000Z",
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": f"Reply number {i} " * 50}],
+                    },
+                }
+            )
+        session_file = tmp_path / "session.jsonl"
+        session_file.write_text("\n".join(json.dumps(e) for e in entries), encoding="utf-8")
+
+        messages = ch.read_jsonl_messages(session_file, quiet=True)
+        parts = ch.generate_markdown_parts(messages, session_file, False, 30)
+
+        assert parts
+        for _, _, part_md, _, _ in parts:
+            assert "**File:** session.jsonl" in part_md
+            assert "**Project:** /home/user/project" in part_md
+
+    def test_level_header_includes_project_and_minimal_fields(self, temp_codex_session_file):
+        """Concise-level headers carry the five fields; minimal drops only the level line."""
+        messages, _ = ch.codex_read_jsonl_messages(temp_codex_session_file)
+
+        md_full = ch.render_markdown_document(
+            temp_codex_session_file, ch.AGENT_CODEX, messages, minimal=False, markdown_level=2
+        )
+        md_minimal = ch.render_markdown_document(
+            temp_codex_session_file, ch.AGENT_CODEX, messages, minimal=True, markdown_level=2
+        )
+
+        for md in (md_full, md_minimal):
+            assert "**File:**" in md
+            assert "**Project:** /home/user/project" in md
+            assert "**Messages:**" in md
+            assert "**First message:**" in md
+            assert "**Last message:**" in md
+        assert "**Markdown detail level:** 2" in md_full
+        assert "**Markdown detail level:**" not in md_minimal
+
+
+# ============================================================================
+# Codex Rollout Filename Prefix Tests
+# ============================================================================
+
+
+class TestCodexRolloutFilenamePrefix:
+    """Codex export filenames drop the rollout-<timestamp>- prefix, keep the UUID."""
+
+    def test_compose_export_stem_strips_rollout_timestamp(self):
+        stem = "rollout-2026-08-19T11-01-32-01a017f7-8325-7c61-8499-c8dae67c6fd4"
+        assert (
+            ch._compose_export_stem("20260819110132", "compare-drivers", stem)
+            == "20260819110132_compare-drivers_01a017f7-8325-7c61-8499-c8dae67c6fd4"
+        )
+
+    def test_compose_export_stem_keeps_non_timestamped_stems(self):
+        assert ch._compose_export_stem("20260819110132", "slug", "rollout-test") == (
+            "20260819110132_slug_rollout-test"
+        )
+        assert ch._compose_export_stem(None, "", "rollout-test") == "rollout-test"
+        assert ch._compose_export_stem("20260101", "s", "c7e6fbcb-6a8a-4637-ab33-6075d83060a8") == (
+            "20260101_s_c7e6fbcb-6a8a-4637-ab33-6075d83060a8"
+        )
+
+    def test_build_output_filename_strips_rollout_timestamp(self, tmp_path):
+        """End-to-end filename build drops the rollout timestamp, keeps the UUID."""
+        session_file = tmp_path / "rollout-2026-08-19T11-01-32-01a017f7-8325-7c61.jsonl"
+        session_file.write_text(
+            json.dumps(
+                {
+                    "timestamp": "2026-08-19T11:01:32.000Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "Compare the two drivers"}],
+                    },
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        messages, _ = ch.codex_read_jsonl_messages(session_file)
+
+        output_name = ch._build_output_filename(session_file, "", messages)
+
+        assert output_name == "20260819110132_Compare-the-two-drivers_01a017f7-8325-7c61.md"
+
+    def test_get_export_output_path_strips_rollout_timestamp(self, tmp_path):
+        """The main export path builder also strips the rollout timestamp."""
+        session_file = tmp_path / "rollout-2026-08-19T11-01-32-01a017f7-8325-7c61.jsonl"
+        session = {"file": session_file, "agent": ch.AGENT_CODEX, "workspace": "-home-user-project"}
+
+        output_file, output_name = ch._get_export_output_path(
+            session, "20260819110132", tmp_path / "out", True, None, "markdown", "compare-drivers"
+        )
+
+        assert output_name == "20260819110132_compare-drivers_01a017f7-8325-7c61.md"
+        assert output_file.name == output_name
+
+
 # Run tests
 # ============================================================================
 

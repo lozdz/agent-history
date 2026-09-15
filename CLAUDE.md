@@ -625,6 +625,10 @@ def parse_jsonl_to_markdown(jsonl_file: Path, minimal: bool = False) -> str:
     # Skip HTML anchors when minimal=True
     if not minimal and msg.get('uuid'):
         md_lines.append(f'<a name="msg-{msg["uuid"]}"></a>')
+
+    # Omit harness-injected internal context when minimal=True
+    if minimal:
+        messages = _filter_minimal_export_messages(messages)
 ```
 
 **What's included:**
@@ -632,12 +636,45 @@ def parse_jsonl_to_markdown(jsonl_file: Path, minimal: bool = False) -> str:
 - Tool use inputs (full JSON)
 - Tool results (complete output)
 - Timestamps
+- Session header fields (File/Project/Messages/First/Last message)
 
 **What's omitted:**
 - All metadata sections (UUIDs, session IDs, etc.)
 - HTML anchors and navigation links
 - Model information
 - Token usage statistics
+- Harness-injected internal context (see below)
+
+**Internal context filtering (all agents):**
+
+`_filter_minimal_export_messages()` drops messages whose `input_origin` is
+`internal_context` or `system_context` before rendering. This removes
+harness/system injections that are not conversation content:
+
+- **Codex:** `<user_instructions>` (AGENTS.md content, available-skills listings), `<environment_context>`, `<turn_aborted>`, and developer/system-role messages (skills and permissions instructions, agent system prompts)
+- **Claude:** harness XML injections (`<local-command-caveat>`, `<command-name>`, `<local-command-stdout>`, `<task-notification>`) and skill context messages
+- **Gemini:** info/error/warning CLI notices
+- **Pi:** compaction summaries, branch summaries, model/label/session-info records
+
+Human prompts, assistant replies, tool calls, and tool results are always kept. Message numbers are renumbered sequentially after filtering. Claude user messages with inline `<system-reminder>` content are intentionally **not** filtered — they are frequently interleaved with real human prompts inside the same message.
+
+Non-minimal exports are unaffected (zero information loss). The filter is applied at every markdown render entry point: `parse_jsonl_to_markdown`, `generate_markdown_parts`, `render_markdown_document` (concise levels 1-3), and the Codex/Gemini/Pi `*_parse_*_to_markdown` functions.
+
+### Session Header Fields
+
+All agents' markdown exports start with the same header fields:
+
+```
+**File:** <source filename (or display_file override)>
+**Project:** <session working directory>
+**Messages:** <count>
+**First message:** <timestamp>
+**Last message:** <timestamp>
+```
+
+- `Project` is omitted when the working directory is unknown
+- Project sources: Claude = first non-empty per-message `cwd`; Codex = `session_meta.cwd`; Gemini = hash-index resolved path or project hash (`gemini_get_workspace_from_session`); Pi = session `cwd` (`pi_get_workspace_from_session`)
+- Rendered by `_generate_session_summary_fields()` (Claude legacy path, Codex, Gemini, Pi) and `_render_markdown_level_header()` (concise levels 1-3)
 
 ## Development Guidelines
 
@@ -753,12 +790,15 @@ Exported files include a human-readable description slug derived from the first 
 **Examples:**
 - `20251120103045_Analyze-amd-driver-load-error_c7e6fbcb-6a8a-4637-ab33-6075d83060a8.md`
 - `20251120150230_Fix-the-login-bug_agent-c17c2c4d.md`
+- `20260819110132_Compare-drivers_01a017f7-8325-7c61-8499-c8dae67c6fd4.md` (Codex rollout stem stripped)
 
 **Slug derivation:**
 - Extracted from the first genuine human prompt (skips internal tool results and context injections)
 - First line only, truncated to 40 characters
 - Preserves Unicode (CJK, etc.); strips punctuation and filesystem-unsafe characters
 - Falls back to the plain timestamp/stem format when no human prompt is available
+
+**Codex rollout stems:** Codex session files are named `rollout-<timestamp>-<uuid>.jsonl`; the rollout timestamp duplicates the export's own `yyyymmddhhmmss` prefix. `_compose_export_stem()` strips the `rollout-<timestamp>-` prefix (via `_strip_codex_rollout_timestamp_prefix()`) so only the trailing session UUID is kept in export filenames.
 
 **Implementation:**
 ```python
@@ -789,9 +829,13 @@ def _build_description_slug(messages: list) -> str:
 **Helper functions:**
 - `_build_description_slug(messages)`: Extracts and sanitizes the first human prompt
 - `_extract_timestamp_prefix(messages)`: Extracts timestamp from first message
-- `_compose_export_stem(ts, slug, stem)`: Assembles filename components
+- `_compose_export_stem(ts, slug, stem)`: Assembles filename components (strips Codex rollout-<timestamp>- prefixes)
+- `_strip_codex_rollout_timestamp_prefix(stem)`: Drops `rollout-<timestamp>-` from Codex stems, keeping the UUID
 
-**Migration note:** The first export run after this feature creates new filenames. Previously-exported files (old `{ts}_{uuid}.md` format) won't match the new names and will be re-exported once.
+**Migration notes:**
+- The first export run after the slug feature creates new filenames. Previously-exported files (old `{ts}_{uuid}.md` format) won't match the new names and will be re-exported once.
+- Codex filenames changed when the `rollout-<timestamp>-` prefix strip was added: existing exports under the old name are orphaned and Codex sessions re-export once under the new name.
+- Minimal-mode content changed when internal-context filtering was added. Already-exported minimal files are not auto-refreshed (staleness detection only tracks mtime and markdown level); re-export with `--force` to refresh them.
 
 ### Date Filtering
 

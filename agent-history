@@ -1772,6 +1772,30 @@ def _message_origin_label(msg: dict) -> str:
     return str(msg.get("role", "unknown")).title()
 
 
+# Origins hidden from minimal exports: harness/system injections are not
+# conversation content. Non-minimal exports keep every message.
+MINIMAL_EXPORT_HIDDEN_ORIGINS = frozenset({INPUT_ORIGIN_INTERNAL_CONTEXT, INPUT_ORIGIN_SYSTEM})
+
+
+def _filter_minimal_export_messages(messages: list) -> list:
+    """Return only real conversation messages for minimal exports.
+
+    Omits harness-injected internal context (Codex ``<user_instructions>`` /
+    AGENTS.md / ``<environment_context>`` / ``<turn_aborted>``, Claude harness
+    XML and skill context, Pi compaction/branch summaries) and system-origin
+    messages (Codex developer/system prompts, skills and permissions
+    instructions, Gemini info/error/warning notices). Human prompts, assistant
+    replies, tool calls and tool results are always kept. Full (non-minimal)
+    exports are unaffected -- zero information loss.
+
+    Claude user messages with inline ``<system-reminder>`` content are
+    intentionally NOT filtered here: they are frequently interleaved with real
+    human prompts inside the same message, so message-level omission would
+    drop genuine conversation content.
+    """
+    return [msg for msg in messages if msg.get("input_origin") not in MINIMAL_EXPORT_HIDDEN_ORIGINS]
+
+
 def _format_tool_use_block(block: dict) -> list:
     """Format a tool_use block as markdown lines."""
     tool_name = block.get("name", "unknown")
@@ -2254,16 +2278,46 @@ def _generate_message_section(
     return lines
 
 
+def _claude_session_project(messages: list) -> str:
+    """Return the first non-empty per-message cwd as the session project."""
+    return next((str(msg.get("cwd")) for msg in messages if msg.get("cwd")), "")
+
+
+def _generate_session_summary_fields(
+    file_label: str,
+    project: Optional[str],
+    message_count: int,
+    first_ts: str,
+    last_ts: str,
+) -> list:
+    """Render the shared File/Project/Messages/First/Last header fields."""
+    lines = [f"**File:** {file_label}"]
+    if project:
+        lines.append(f"**Project:** {project}")
+    lines.append(f"**Messages:** {message_count}")
+    if first_ts:
+        lines.append(f"**First message:** {first_ts}")
+    if last_ts:
+        lines.append(f"**Last message:** {last_ts}")
+    return lines
+
+
 def _generate_markdown_file_header(
     jsonl_file: Path, messages: list, is_agent: bool, display_file: Optional[str] = None
 ) -> list:
     """Generate the file header section of markdown."""
     lines = ["# Claude Conversation (Agent)" if is_agent else "# Claude Conversation", ""]
-    lines.append(f"**File:** {display_file or jsonl_file.name}")
-    lines.append(f"**Messages:** {len(messages)}")
-    if messages:
-        lines.append(f"**First message:** {messages[0]['timestamp']}")
-        lines.append(f"**Last message:** {messages[-1]['timestamp']}")
+    first_ts = messages[0].get("timestamp", "") if messages else ""
+    last_ts = messages[-1].get("timestamp", "") if messages else ""
+    lines.extend(
+        _generate_session_summary_fields(
+            display_file or jsonl_file.name,
+            _claude_session_project(messages),
+            len(messages),
+            first_ts,
+            last_ts,
+        )
+    )
     return lines
 
 
@@ -2301,6 +2355,9 @@ def parse_jsonl_to_markdown(
     if messages is None:
         messages = read_jsonl_messages(jsonl_file)
 
+    if minimal:
+        messages = _filter_minimal_export_messages(messages)
+
     is_agent, parent_session_id, agent_id = _get_agent_info(messages)
 
     md_lines = _generate_markdown_file_header(jsonl_file, messages, is_agent, display_file)
@@ -2324,6 +2381,11 @@ def generate_markdown_parts(
     """
     if not split_lines or len(messages) == 0:
         return None
+
+    if minimal:
+        messages = _filter_minimal_export_messages(messages)
+        if not messages:
+            return None
 
     # Find all split points
     split_points = [0]  # Start with message 0
@@ -2351,6 +2413,9 @@ def generate_markdown_parts(
 
     total_parts = len(split_points) - 1
     parts = []
+    # Parts may start with messages that carry no cwd (e.g. assistant
+    # messages), so resolve the project once from the full message list.
+    session_project = _claude_session_project(messages)
 
     for part_num in range(total_parts):
         start_idx = split_points[part_num]
@@ -2367,6 +2432,7 @@ def generate_markdown_parts(
             start_msg_num=start_idx + 1,
             end_msg_num=end_idx,
             display_file=display_file,
+            session_project=session_project,
         )
 
         parts.append((part_num + 1, total_parts, part_md, start_idx + 1, end_idx))
@@ -2374,7 +2440,7 @@ def generate_markdown_parts(
     return parts
 
 
-def _generate_markdown_header(
+def _generate_markdown_header(  # noqa: PLR0913
     jsonl_file,
     part_messages,
     is_agent,
@@ -2382,7 +2448,9 @@ def _generate_markdown_header(
     total_parts,
     start_msg_num,
     end_msg_num,
+    *,
     display_file: Optional[str] = None,
+    session_project: Optional[str] = None,
 ):
     """Generate markdown header section."""
     md_lines = []
@@ -2396,6 +2464,9 @@ def _generate_markdown_header(
 
     md_lines.append("")
     md_lines.append(f"**File:** {display_file or jsonl_file.name}")
+    project = session_project or _claude_session_project(part_messages)
+    if project:
+        md_lines.append(f"**Project:** {project}")
 
     if part_num and total_parts:
         md_lines.append(f"**Part:** {part_num} of {total_parts}")
@@ -2544,7 +2615,7 @@ def _extract_agent_metadata(messages: list) -> tuple:
     return True, first_msg.get("sessionId"), first_msg.get("agentId")
 
 
-def generate_markdown_for_messages(
+def generate_markdown_for_messages(  # noqa: PLR0913
     part_messages,
     jsonl_file,
     minimal,
@@ -2552,7 +2623,9 @@ def generate_markdown_for_messages(
     total_parts=None,
     start_msg_num=1,
     end_msg_num=None,
+    *,
     display_file: Optional[str] = None,
+    session_project: Optional[str] = None,
 ):
     """Generate markdown for a subset of messages (used for splitting)."""
     is_agent, parent_session_id, agent_id = _extract_agent_metadata(part_messages)
@@ -2566,6 +2639,7 @@ def generate_markdown_for_messages(
         start_msg_num,
         end_msg_num,
         display_file=display_file,
+        session_project=session_project,
     )
 
     if is_agent:
@@ -2720,11 +2794,11 @@ def _render_legacy_markdown_document(
 ) -> str:
     """Render the legacy full-detail Markdown format."""
     if agent == AGENT_GEMINI:
-        return gemini_parse_json_to_markdown(jsonl_file, minimal=minimal)
+        return gemini_parse_json_to_markdown(jsonl_file, minimal=minimal, display_file=display_file)
     if agent == AGENT_CODEX:
-        return codex_parse_jsonl_to_markdown(jsonl_file, minimal=minimal)
+        return codex_parse_jsonl_to_markdown(jsonl_file, minimal=minimal, display_file=display_file)
     if agent == AGENT_PI:
-        return pi_parse_jsonl_to_markdown(jsonl_file, minimal=minimal)
+        return pi_parse_jsonl_to_markdown(jsonl_file, minimal=minimal, display_file=display_file)
     return parse_jsonl_to_markdown(
         jsonl_file, minimal=minimal, messages=messages, display_file=display_file
     )
@@ -2740,6 +2814,19 @@ def _markdown_first_last_timestamps(messages: list) -> tuple[str, str]:
     return first_ts, last_ts
 
 
+def _markdown_session_project(agent: str, jsonl_file: Path, messages: list) -> str:
+    """Resolve the session working directory for the Project header field."""
+    if agent == AGENT_GEMINI:
+        project = gemini_get_workspace_from_session(json_file=jsonl_file)
+        return "" if project == "unknown" else project
+    if agent == AGENT_PI:
+        project = pi_get_workspace_from_session(jsonl_file)
+        return "" if project == "unknown" else project
+    if agent == AGENT_CODEX:
+        return codex_get_session_cwd(jsonl_file)
+    return _claude_session_project(messages)
+
+
 def _render_markdown_level_header(
     jsonl_file: Path,
     agent: str,
@@ -2750,21 +2837,18 @@ def _render_markdown_level_header(
 ) -> list[str]:
     """Render header for concise Markdown detail levels."""
     lines = [f"# {_markdown_agent_title(agent)} Conversation", ""]
-    if minimal:
-        return lines
-
-    lines.extend(
-        [
-            f"**File:** {display_file or jsonl_file.name}",
-            f"**Messages:** {len(messages)}",
-            f"**Markdown detail level:** {markdown_level}",
-        ]
-    )
     first_ts, last_ts = _markdown_first_last_timestamps(messages)
-    if first_ts:
-        lines.append(f"**First message:** {first_ts}")
-    if last_ts:
-        lines.append(f"**Last message:** {last_ts}")
+    lines.extend(
+        _generate_session_summary_fields(
+            display_file or jsonl_file.name,
+            _markdown_session_project(agent, jsonl_file, messages),
+            len(messages),
+            first_ts,
+            last_ts,
+        )
+    )
+    if not minimal:
+        lines.append(f"**Markdown detail level:** {markdown_level}")
     lines.append("")
     return lines
 
@@ -2782,6 +2866,8 @@ def render_markdown_document(
     if safe_level >= MARKDOWN_DEFAULT_LEVEL:
         return _render_legacy_markdown_document(jsonl_file, agent, messages, minimal, display_file)
 
+    if minimal:
+        messages = _filter_minimal_export_messages(messages)
     annotate_conversation_messages(messages, agent)
     lines = _render_markdown_level_header(
         jsonl_file, agent, messages, minimal, safe_level, display_file
@@ -5977,23 +6063,58 @@ def codex_get_first_timestamp(jsonl_file: Path) -> Optional[str]:
     return None
 
 
-def codex_parse_jsonl_to_markdown(jsonl_file: Path, minimal: bool = False) -> str:
+def codex_get_session_cwd(jsonl_file: Path) -> str:
+    """Get the working directory from a Codex session's session_meta line.
+
+    Args:
+        jsonl_file: Path to the Codex rollout .jsonl file
+
+    Returns:
+        Working directory string or "" if not found
+    """
+    try:
+        with open(jsonl_file, encoding="utf-8") as f:
+            for line in f:
+                entry = json.loads(line)
+                if entry.get("type") == "session_meta":
+                    return entry.get("payload", {}).get("cwd") or ""
+                if entry.get("type") == "response_item":
+                    break  # session_meta is always the first entry; stop early
+    except (OSError, json.JSONDecodeError):
+        pass
+    return ""
+
+
+def codex_parse_jsonl_to_markdown(
+    jsonl_file: Path, minimal: bool = False, display_file: Optional[str] = None
+) -> str:
     """Convert Codex rollout JSONL to markdown format.
 
     Args:
         jsonl_file: Path to the Codex rollout .jsonl file
         minimal: If True, omit metadata sections
+        display_file: Optional display name for the source file header
 
     Returns:
         Markdown formatted string of the conversation
     """
     messages, session_meta = codex_read_jsonl_messages(jsonl_file)
+    if minimal:
+        messages = _filter_minimal_export_messages(messages)
 
+    project = (session_meta or {}).get("cwd") or codex_get_session_cwd(jsonl_file)
+    first_ts, last_ts = _markdown_first_last_timestamps(messages)
     md_lines = ["# Codex Conversation", ""]
+    md_lines.extend(
+        _generate_session_summary_fields(
+            display_file or jsonl_file.name, project, len(messages), first_ts, last_ts
+        )
+    )
 
     if session_meta and not minimal:
         md_lines.extend(
             [
+                "",
                 "## Session Metadata",
                 "",
                 f"- **Session ID:** `{session_meta.get('id', 'unknown')}`",
@@ -6771,21 +6892,36 @@ def _gemini_format_message(msg: dict, msg_num: int, minimal: bool) -> list:
     return lines
 
 
-def gemini_parse_json_to_markdown(json_file: Path, minimal: bool = False) -> str:
+def gemini_parse_json_to_markdown(
+    json_file: Path, minimal: bool = False, display_file: Optional[str] = None
+) -> str:
     """Convert Gemini session JSON to markdown format.
 
     Args:
         json_file: Path to the Gemini session .json file
         minimal: If True, omit metadata sections
+        display_file: Optional display name for the source file header
 
     Returns:
         Markdown formatted string of the conversation
     """
     messages, session_meta = gemini_read_json_messages(json_file)
+    if minimal:
+        messages = _filter_minimal_export_messages(messages)
+    first_ts, last_ts = _markdown_first_last_timestamps(messages)
     md_lines = ["# Gemini Conversation", ""]
+    md_lines.extend(
+        _generate_session_summary_fields(
+            display_file or json_file.name,
+            _markdown_session_project(AGENT_GEMINI, json_file, messages),
+            len(messages),
+            first_ts,
+            last_ts,
+        )
+    )
 
     if session_meta and not minimal:
-        md_lines.extend(_gemini_format_session_metadata(session_meta))
+        md_lines.extend(["", *_gemini_format_session_metadata(session_meta)])
 
     md_lines.extend(["---", ""])
 
@@ -7603,14 +7739,26 @@ def pi_count_messages(jsonl_file: Path) -> int:
     return sum(1 for msg in messages if msg.get("role") in ("user", "assistant"))
 
 
-def pi_parse_jsonl_to_markdown(jsonl_file: Path, minimal: bool = False) -> str:
+def pi_parse_jsonl_to_markdown(
+    jsonl_file: Path, minimal: bool = False, display_file: Optional[str] = None
+) -> str:
     """Convert Pi JSONL to markdown format."""
     messages, session_meta = pi_read_jsonl_messages(jsonl_file)
+    if minimal:
+        messages = _filter_minimal_export_messages(messages)
+    project = _markdown_session_project(AGENT_PI, jsonl_file, messages)
+    first_ts, last_ts = _markdown_first_last_timestamps(messages)
     md_lines = ["# Pi Conversation", ""]
+    md_lines.extend(
+        _generate_session_summary_fields(
+            display_file or jsonl_file.name, project, len(messages), first_ts, last_ts
+        )
+    )
 
     if session_meta and not minimal:
         md_lines.extend(
             [
+                "",
                 "## Session Metadata",
                 "",
                 f"- **Session ID:** `{session_meta.get('id', 'unknown')}`",
@@ -12191,8 +12339,23 @@ def _build_description_slug(messages: list) -> str:
     return text[:DESCRIPTION_SLUG_MAXLEN].strip("-.")
 
 
+# Codex rollout stems look like rollout-2026-08-19T11-01-32-<uuid>; the
+# timestamp duplicates the export's own ts_prefix, so only the UUID is kept.
+CODEX_ROLLOUT_TIMESTAMP_PREFIX_RE = re.compile(r"^rollout-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-")
+
+
+def _strip_codex_rollout_timestamp_prefix(stem: str) -> str:
+    """Drop the rollout-<timestamp>- prefix from Codex session file stems."""
+    return CODEX_ROLLOUT_TIMESTAMP_PREFIX_RE.sub("", stem, count=1)
+
+
 def _compose_export_stem(ts_prefix: Optional[str], slug: str, stem: str) -> str:
-    """Join timestamp, description slug, and file stem with underscores, skipping blanks."""
+    """Join timestamp, description slug, and file stem with underscores, skipping blanks.
+
+    Codex rollout-<timestamp>- prefixes are stripped from the stem first: the
+    timestamp duplicates ts_prefix and only the trailing session UUID is kept.
+    """
+    stem = _strip_codex_rollout_timestamp_prefix(stem)
     return "_".join(part for part in (ts_prefix, slug, stem) if part)
 
 

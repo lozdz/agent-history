@@ -652,6 +652,67 @@ class TestCodexFunctionFormatting:
         assert "call_123" in result
         assert '{"command": "pwd"}' in result
 
+    def test_format_custom_tool_call_input(self):
+        """Current Codex custom tool calls store arguments in ``input``."""
+        payload = {
+            "type": "custom_tool_call",
+            "name": "exec",
+            "input": '{"cmd":"pwd","workdir":"/tmp"}',
+            "call_id": "call_current",
+        }
+
+        result = ch.codex_format_function_call(payload)
+
+        assert "**[Tool: exec]**" in result
+        assert "call_current" in result
+        assert '{"cmd":"pwd","workdir":"/tmp"}' in result
+
+    def test_format_custom_tool_call_output_text_blocks(self):
+        """Current Codex tool results use arrays of text blocks."""
+        payload = {
+            "type": "custom_tool_call_output",
+            "call_id": "call_current",
+            "output": [
+                {"type": "input_text", "text": "Command completed"},
+                {"type": "input_text", "text": "Printed output"},
+            ],
+        }
+
+        result = ch.codex_format_function_result(payload)
+
+        assert "Command completed\nPrinted output" in result
+        assert "{'type': 'input_text'" not in result
+
+    def test_read_current_codex_custom_tool_records(self, tmp_path):
+        """New Codex call/result fields survive JSONL parsing as readable text."""
+        session_file = tmp_path / "current-codex.jsonl"
+        records = [
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "custom_tool_call",
+                    "name": "exec",
+                    "input": '{"cmd":"pwd"}',
+                    "call_id": "call_current",
+                },
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "custom_tool_call_output",
+                    "call_id": "call_current",
+                    "output": [{"type": "input_text", "text": "/workspace/project"}],
+                },
+            },
+        ]
+        session_file.write_text("\n".join(json.dumps(record) for record in records))
+
+        messages, _ = ch.codex_read_jsonl_messages(session_file)
+
+        assert '"cmd":"pwd"' in messages[0]["content"]
+        assert "/workspace/project" in messages[1]["content"]
+        assert "{'type': 'input_text'" not in messages[1]["content"]
+
     def test_format_function_result(self):
         """Should format function result as markdown."""
         payload = {"call_id": "call_123", "output": "/home/user/project"}

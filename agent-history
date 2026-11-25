@@ -5927,7 +5927,11 @@ def codex_format_function_call(payload: dict) -> str:
         Formatted markdown string for the tool call
     """
     name = payload.get("name", "unknown")
-    args = payload.get("arguments", "{}")
+    args = payload.get("arguments")
+    if args is None:
+        args = payload.get("input", "{}")
+    if isinstance(args, (dict, list)):
+        args = pretty_json(args)
     call_id = payload.get("call_id", "")
     return f"**[Tool: {name}]**\nCall ID: `{call_id}`\n```json\n{args}\n```"
 
@@ -5943,6 +5947,18 @@ def codex_format_function_result(payload: dict) -> str:
     """
     call_id = payload.get("call_id", "")
     output = payload.get("output", "")
+    if isinstance(output, list):
+        text_parts = [
+            item["text"]
+            for item in output
+            if isinstance(item, dict) and isinstance(item.get("text"), str)
+        ]
+        if text_parts:
+            output = "\n".join(text_parts)
+        else:
+            output = pretty_json(output)
+    elif isinstance(output, dict):
+        output = pretty_json(output)
     return f"**[Tool Result]**\nCall ID: `{call_id}`\n```\n{output}\n```"
 
 
